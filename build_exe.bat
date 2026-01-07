@@ -1,33 +1,15 @@
 @echo off
-setlocal EnableExtensions
+setlocal
 
-REM ===============================
-REM Clean previous build artifacts
-REM ===============================
-echo [0/3] Cleaning previous build cache...
-if exist build (
-  rmdir /s /q build
-)
-if exist dist (
-  rmdir /s /q dist
-)
-if exist image_to_video_converter.spec (
-  del /f /q image_to_video_converter.spec
-)
+REM Use the current Python environment to build the exe.
+REM IMPORTANT: Tkinter is not a pip package. If your Python does not include Tk/Tcl,
+REM the built exe will fail with: No module named 'tkinter'.
 
-echo [1/3] Creating venv...
-if not exist .venv (
-  python -m venv .venv
-)
+python -m pip install -U pyinstaller
 
-echo [2/3] Installing PyInstaller...
-call .venv\Scripts\python.exe -m pip install --upgrade pip
-call .venv\Scripts\python.exe -m pip install --upgrade pyinstaller
-
-echo [3/3] Building EXE...
-call .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onefile image_to_video_converter.py
+REM Build using spec (includes runtime hook for Tcl/Tk discovery)
+pyinstaller -y image_to_video_converter.spec
 
 echo.
-echo Done. EXE is in: dist\image_to_video_converter.exe
+echo Build finished. Output: dist\image_to_video_converter.exe
 pause
-

@@ -2,11 +2,20 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional
 
 # Import the logger we created
 from logging_config import logger
+
+try:
+    # Drag & drop support (Windows/macOS/Linux) via tkinterdnd2
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+except Exception:
+    TkinterDnD = None
+    DND_FILES = None
+
 
 class ImageToVideoConverter:
     def __init__(self, root):
@@ -70,30 +79,46 @@ class ImageToVideoConverter:
         
         # Convert button
         self.convert_btn = ttk.Button(
-            main_frame, 
-            text="开始转换", 
+            main_frame,
+            text="开始转换",
             command=self.convert,
             state=tk.DISABLED
         )
         self.convert_btn.pack(pady=10)
-        
+
+        # Log / error output area (shown below the button)
+        log_frame = ttk.LabelFrame(main_frame, text="日志/错误信息", padding=(8, 6))
+        log_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 6))
+
+        self.log_text = tk.Text(log_frame, height=6, wrap="word")
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        # 默认只读（需要写入时临时解锁）
+        self.log_text.configure(state=tk.DISABLED)
+
         # Status bar
-        self.status_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="就绪")
         self.status_bar = ttk.Label(
-            self.root, 
-            textvariable=self.status_var, 
-            relief=tk.SUNKEN, 
+            self.root,
+            textvariable=self.status_var,
+            relief=tk.SUNKEN,
             anchor=tk.W
         )
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         
-        # Bind drag and drop events
-        self.drop_frame.bind("<Button-1>", self.browse_file)
-        self.drop_frame.bind("<Enter>", self.on_enter)
-        self.drop_frame.bind("<Leave>", self.on_leave)
+        # Bind click events (make the whole big area clickable)
+        # 注意：ttk.LabelFrame 的标题区域与内部控件是不同的窗口区域，
+        # 仅绑定 drop_frame 往往只能点到边框/标题附近。
+        # 因此这里同时给容器与内部所有子控件都绑定点击事件。
+        self._bind_click_recursive(self.drop_frame, self.browse_file)
+        self._bind_hover_recursive(self.drop_frame)
         
-        # Drag and drop (Tkinter 原生不支持，需要额外库，如 tkinterdnd2)
-        # 为保证 EXE 可直接运行，这里默认关闭拖拽；如需拖拽我可以给你集成 tkinterdnd2 的版本。
+        # Drag and drop support (tkinterdnd2)
+        self._setup_drag_and_drop()
     
     def on_enter(self, event):
         self.drop_frame.configure(style='Drop.TLabelframe')
@@ -101,13 +126,117 @@ class ImageToVideoConverter:
     def on_leave(self, event):
         self.drop_frame.configure(style='TLabelframe')
     
+    def _setup_drag_and_drop(self):
+        """启用拖拽上传（需要安装 tkinterdnd2）。
+
+        说明：原生 Tkinter 不支持系统级文件拖拽。若 tkinterdnd2 不可用，
+        本方法会降级为仅点击选择。
+        """
+        if TkinterDnD is None or DND_FILES is None:
+            logger.info("tkinterdnd2 not available; drag-and-drop disabled.")
+            return
+
+        try:
+            # 注册拖拽目标
+            self.drop_frame.drop_target_register(DND_FILES)
+            self.drop_frame.dnd_bind('<<Drop>>', self.on_drop)
+
+            # 有些情况下事件会落在内部 label 上，因此也给 label 注册
+            self.drop_label.drop_target_register(DND_FILES)
+            self.drop_label.dnd_bind('<<Drop>>', self.on_drop)
+
+            logger.info("Drag-and-drop enabled via tkinterdnd2.")
+        except Exception as e:
+            logger.exception("Failed to enable drag-and-drop")
+            self._log_append(f"启用拖拽失败（将仅支持点击选择）：\n{str(e)}\n")
+
+    def _parse_drop_files(self, data: str):
+        """解析 tkinterdnd2 传入的文件列表字符串，返回路径列表。"""
+        if not data:
+            return []
+
+        data = data.strip()
+
+        # tkdnd 在 Windows 常见格式：
+        # 1) {C:/path with space/a.jpg}
+        # 2) C:/a.jpg
+        # 3) {C:/a.jpg} {C:/b.jpg}
+        files = []
+        buf = ''
+        in_brace = False
+        for ch in data:
+            if ch == '{':
+                in_brace = True
+                buf = ''
+                continue
+            if ch == '}':
+                in_brace = False
+                if buf:
+                    files.append(buf)
+                buf = ''
+                continue
+            if ch == ' ' and not in_brace:
+                if buf:
+                    files.append(buf)
+                    buf = ''
+                continue
+            buf += ch
+        if buf:
+            files.append(buf)
+
+        # 规范化路径（tkdnd 可能给 / 或 \ 混用）
+        norm = []
+        for f in files:
+            f = f.strip().strip('"')
+            if f:
+                norm.append(os.path.normpath(f))
+        return norm
+
     def on_drop(self, event):
-        # Get the file path from the drop event
-        file_path = event.data.strip('{}')
-        if os.path.isfile(file_path) and self.is_supported_file(file_path):
-            self.set_input_file(file_path)
-        else:
-            messagebox.showerror("错误", "请拖放有效的图片文件")
+        """拖拽文件到区域后的处理。"""
+        try:
+            paths = self._parse_drop_files(getattr(event, 'data', ''))
+            if not paths:
+                self._log_append("未识别到拖拽的文件路径。\n")
+                return
+
+            # 只取第一个文件
+            file_path = paths[0]
+
+            if os.path.isfile(file_path) and self.is_supported_file(file_path):
+                self.set_input_file(file_path)
+            else:
+                self._set_status("拖拽文件无效")
+                self._log_append(f"拖拽的文件不是支持的图片：{file_path}\n")
+        except Exception as e:
+            self._set_status("拖拽解析失败")
+            self._log_append(f"处理拖拽时出错：\n{str(e)}\n")
+            logger.exception("Error handling drop event")
+
+    def _bind_click_recursive(self, widget, callback):
+        """给 widget 及其所有子控件绑定左键点击。
+
+        ttk.LabelFrame 的标题/边框与内部控件有时不会触发同一个 bind，
+        所以用递归绑定确保点击“大框任意位置”都能唤起选择文件窗口。
+        """
+        try:
+            widget.bind("<Button-1>", callback)
+        except Exception:
+            pass
+
+        for child in widget.winfo_children():
+            self._bind_click_recursive(child, callback)
+
+    def _bind_hover_recursive(self, widget):
+        """递归绑定 hover 效果，让整个区域鼠标移入/移出都变色。"""
+        try:
+            widget.bind("<Enter>", self.on_enter)
+            widget.bind("<Leave>", self.on_leave)
+        except Exception:
+            pass
+
+        for child in widget.winfo_children():
+            self._bind_hover_recursive(child)
     
     def is_supported_file(self, file_path: str) -> bool:
         ext = os.path.splitext(file_path)[1].lower()
@@ -147,6 +276,31 @@ class ImageToVideoConverter:
             logger.info(f"Output directory changed to: {dir_path}")
             self.output_var.set(f"输出目录: {dir_path}")
     
+    def _log_clear(self):
+        if not hasattr(self, "log_text"):
+            return
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _log_append(self, text: str):
+        if not hasattr(self, "log_text"):
+            return
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, text)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _set_status(self, text: str):
+        self.status_var.set(text)
+        # 强制刷新一次 UI：update_idletasks 仅处理绘制队列；
+        # 某些情况下（尤其是打包后的 exe）需要再补一次 update，确保状态栏立刻重绘。
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except Exception:
+            pass
+
     def check_ffmpeg(self):
         try:
             subprocess.run(
@@ -204,10 +358,15 @@ class ImageToVideoConverter:
         ]
         
         logger.info(f"Starting conversion. Input: {input_path}, Output: {output_path}, Duration: {duration}s")
-        logger.info("FFmpeg command: " + " ".join(cmd))
+        ffmpeg_cmd_str = " ".join(cmd)
+        logger.info("FFmpeg command: " + ffmpeg_cmd_str)
 
-        self.status_var.set("正在转换...")
-        self.root.update()
+        self._log_clear()
+        self._log_append("FFmpeg 指令:\n" + ffmpeg_cmd_str + "\n\n")
+        self._set_status("正在转换...")
+
+        # 转换期间禁用按钮，避免重复启动多个 ffmpeg
+        self.convert_btn.config(state=tk.DISABLED)
         
         try:
             process = subprocess.Popen(
@@ -218,57 +377,104 @@ class ImageToVideoConverter:
                 creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0)
             )
 
-            # 轮询进程结束；结束后务必读取 stdout/stderr（避免缓冲区导致异常/卡死），并检查输出文件大小
-            def check_process():
-                return_code = process.poll()
-                if return_code is None:
-                    self.root.after(150, check_process)
-                    return
+            logger.info("Started ffmpeg process, waiting in background thread...")
 
-                out, err = process.communicate()
+            def worker_wait():
+                try:
+                    out, err = process.communicate()
+                    return_code = process.returncode
 
-                # 如果 ffmpeg 返回 0 但文件为 0KB，也视为失败并提示日志
-                file_ok = output_path.exists() and output_path.stat().st_size > 0
-
-                if return_code == 0 and file_ok:
-                    self.status_var.set(f"转换完成: {output_path}")
-                    messagebox.showinfo(
-                        "成功",
-                        f"视频已保存到:\n{output_path}"
+                    file_ok = output_path.exists() and output_path.stat().st_size > 0
+                    logger.info(
+                        f"FFmpeg exited. return_code={return_code}, file_ok={file_ok}, output_exists={output_path.exists()}"
                     )
-                    logger.info(f"Conversion succeeded. Output file: {output_path} ({output_path.stat().st_size} bytes)")
-                    os.startfile(output_path.parent)
-                else:
-                    self.status_var.set("转换失败")
-                    debug = []
-                    debug.append("FFmpeg 命令:\n" + " ".join(cmd))
-                    debug.append(f"返回码: {return_code}")
-                    if output_path.exists():
-                        debug.append(f"输出文件大小: {output_path.stat().st_size} bytes")
-                    else:
-                        debug.append("输出文件不存在")
-                    if err:
-                        debug.append("\nFFmpeg 错误输出(stderr):\n" + err)
-                    if out:
-                        debug.append("\nFFmpeg 标准输出(stdout):\n" + out)
 
-                    logger.error("Conversion failed. " + " | ".join([d.replace("\n", " ") for d in debug]))
-                    if err:
-                        logger.error("FFmpeg stderr:\n" + err)
-                    if out:
-                        logger.info("FFmpeg stdout:\n" + out)
-                    messagebox.showerror("错误", "\n\n".join(debug))
+                    def update_ui():
+                        if return_code == 0 and file_ok:
+                            self._set_status(f"转换完成: {output_path}")
+                            self._log_append(
+                                f"转换成功！\n输出文件: {output_path}\n大小: {output_path.stat().st_size} bytes\n"
+                            )
+                            logger.info(
+                                f"Conversion succeeded. Output file: {output_path} ({output_path.stat().st_size} bytes)"
+                            )
 
-            self.root.after(150, check_process)
+                            # 恢复按钮
+                            self.convert_btn.config(state=tk.NORMAL)
+
+                            # 弹窗前再刷新一次 UI，避免视觉上状态栏未更新
+                            self.root.update_idletasks()
+
+                            messagebox.showinfo(
+                                "成功",
+                                f"视频已保存到:\n{output_path}"
+                            )
+                            os.startfile(output_path.parent)
+                        else:
+                            self._set_status("转换失败")
+                            debug = []
+                            debug.append("转换失败（请查看下方日志/错误信息）\n")
+                            debug.append("FFmpeg 命令:\n" + " ".join(cmd))
+                            debug.append(f"返回码: {return_code}")
+                            if output_path.exists():
+                                debug.append(f"输出文件大小: {output_path.stat().st_size} bytes")
+                            else:
+                                debug.append("输出文件不存在")
+                            if err:
+                                debug.append("\nFFmpeg 错误输出(stderr):\n" + err)
+                            if out:
+                                debug.append("\nFFmpeg 标准输出(stdout):\n" + out)
+
+                            # 写到 UI 下方日志框
+                            self._log_append("\n\n".join(debug) + "\n")
+
+                            logger.error(
+                                "Conversion failed. " + " | ".join([d.replace("\n", " ") for d in debug])
+                            )
+                            if err:
+                                logger.error("FFmpeg stderr:\n" + err)
+                            if out:
+                                logger.info("FFmpeg stdout:\n" + out)
+
+                            # 恢复按钮（允许重试）
+                            self.convert_btn.config(state=tk.NORMAL)
+
+                    # 必须切回主线程更新 Tk UI
+                    self.root.after(0, update_ui)
+
+                except Exception as e:
+                    logger.exception("worker_wait exception")
+
+                    def update_ui_error():
+                        self._set_status("转换失败")
+                        self._log_append(f"等待 FFmpeg 结束时发生异常:\n{str(e)}\n")
+                        try:
+                            self.convert_btn.config(state=tk.NORMAL)
+                        except Exception:
+                            pass
+
+                    self.root.after(0, update_ui_error)
+
+            threading.Thread(target=worker_wait, daemon=True).start()
             
         except Exception as e:
-            self.status_var.set("转换失败")
+            self._set_status("转换失败")
+            self._log_append(f"执行 FFmpeg 时出错:\n{str(e)}\n")
             logger.exception("Exception while running FFmpeg")
+            # 恢复按钮（允许重试）
+            try:
+                self.convert_btn.config(state=tk.NORMAL)
+            except Exception:
+                pass
             messagebox.showerror("错误", f"执行 FFmpeg 时出错:\n{str(e)}")
 
 
 def main():
-    root = tk.Tk()
+    # 若安装了 tkinterdnd2，则必须使用 TkinterDnD.Tk() 才能接收系统文件拖拽
+    if TkinterDnD is not None:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
     
     # Configure styles
     style = ttk.Style()
