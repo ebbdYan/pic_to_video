@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 # dist/
+dist/image_to_video_converter/_internal
 
 # PyInstaller
 *.spec
