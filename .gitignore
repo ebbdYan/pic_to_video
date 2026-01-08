@@ -4,7 +4,7 @@ build/
 dist/image_to_video_converter/_internal
 
 # PyInstaller
-*.spec
+# *.spec
 
 # Python cache
 __pycache__/
