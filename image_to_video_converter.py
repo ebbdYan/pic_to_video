@@ -36,7 +36,7 @@ class ImageToVideoConverter:
         self.input_files: list[str] = []
         # 默认输出目录：与输入图片同级目录（选择文件后自动更新）
         self.output_dir: str = ""
-        self.duration: tk.IntVar = tk.IntVar(value=5)  # Default 5 seconds
+        self.duration: tk.IntVar = tk.IntVar(value=3)  # Default 3 seconds
 
         # 批量转换状态
         self._batch_total: int = 0
@@ -382,13 +382,19 @@ class ImageToVideoConverter:
         cmd = [
             "ffmpeg",
             "-y",
+            # 降低内存占用：限制线程数（部分机器/环境下大图编码可能出现 Cannot allocate memory）
+            "-threads", "1",
+            "-thread_type", "slice",
             "-loop", "1",
             "-framerate", "30",
             "-i", str(input_path),
             "-t", str(duration),
-            "-vf", "fps=30,scale=1920:-2:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
+            # stillimage + 限制分辨率 + pad 到偶数，提升兼容性并减少编码压力
+            "-vf", "fps=30,scale=1280:-2:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
             "-c:v", "libx264",
-            "-preset", "medium",
+            # ultrafast 内存/CPU压力更小；stillimage 更适合静态图
+            "-preset", "ultrafast",
+            "-tune", "stillimage",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
