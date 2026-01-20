@@ -1,6 +1,7 @@
 import os
 import sys
 import tkinter as tk
+from PIL import Image
 from tkinter import ttk, filedialog, messagebox
 import subprocess
 import threading
@@ -91,14 +92,40 @@ class ImageToVideoConverter:
             command=self.change_output_dir
         ).pack(side=tk.RIGHT, padx=5)
 
-        # Convert button
+        # Buttons row
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+
         self.convert_btn = ttk.Button(
-            main_frame,
+            btn_frame,
             text="开始转换",
             command=self.convert,
             state=tk.DISABLED
         )
-        self.convert_btn.pack(pady=10)
+        self.convert_btn.grid(row=0, column=1, padx=6)
+
+        # Image convert controls (for .webp)
+        self.img_format_var = tk.StringVar(value="png")
+        self.img_format_combo = ttk.Combobox(
+            btn_frame,
+            textvariable=self.img_format_var,
+            values=["png", "jpg"],
+            width=5,
+            state="disabled"
+        )
+        self.img_format_combo.grid(row=0, column=0, sticky=tk.E, padx=6)
+
+        self.img_convert_btn = ttk.Button(
+            btn_frame,
+            text="图片转换",
+            command=self.convert_image_format,
+            state=tk.DISABLED
+        )
+        self.img_convert_btn.grid(row=0, column=2, sticky=tk.W, padx=6)
 
         # Log / error output area (shown below the button)
         log_frame = ttk.LabelFrame(main_frame, text="日志/错误信息", padding=(8, 6))
@@ -258,6 +285,9 @@ class ImageToVideoConverter:
             self._log_append(f"已接收 {len(images)} 个图片任务（来自拖拽多文件/文件夹）。\n")
             logger.info(f"Drop received. images={len(images)}")
 
+            # 根据是否包含 webp 启用/禁用图片转换功能
+            self._update_image_convert_controls(self.input_files)
+
         except Exception as e:
             self._set_status("拖拽解析失败")
             self._log_append(f"处理拖拽时出错：\n{str(e)}\n")
@@ -315,6 +345,9 @@ class ImageToVideoConverter:
         # 单选时同步批量队列
         self.input_files = [file_path]
 
+        # 根据是否为 webp 启用/禁用图片转换功能
+        self._update_image_convert_controls(self.input_files)
+
     def change_output_dir(self):
         dir_path = filedialog.askdirectory(initialdir=self.output_dir)
         if dir_path:
@@ -344,6 +377,89 @@ class ImageToVideoConverter:
             self.root.update()
         except Exception:
             pass
+
+    def _update_image_convert_controls(self, files: list[str]):
+        """根据是否包含 webp 文件启用/禁用图片转换控件。"""
+        has_webp = any(str(f).lower().endswith('.webp') for f in (files or []))
+        state = tk.NORMAL if has_webp else tk.DISABLED
+
+        try:
+            self.img_convert_btn.config(state=state)
+        except Exception:
+            pass
+
+        try:
+            self.img_format_combo.config(state='readonly' if has_webp else 'disabled')
+        except Exception:
+            pass
+
+    def convert_image_format(self):
+        """将当前队列中的 webp 文件转换成 png 或 jpg，并输出到输出目录。"""
+        if self._is_converting:
+            self._log_append("正在转换视频中，请稍候再进行图片转换。\n")
+            return
+
+        if not self.input_files:
+            messagebox.showerror("错误", "请先选择或拖拽图片文件")
+            return
+
+        fmt = (self.img_format_var.get() or 'png').lower().strip()
+        if fmt not in ('png', 'jpg'):
+            fmt = 'png'
+
+        webps = [p for p in self.input_files if str(p).lower().endswith('.webp') and os.path.isfile(p)]
+        if not webps:
+            messagebox.showinfo("提示", "当前选择中不包含 WebP 文件")
+            self._update_image_convert_controls(self.input_files)
+            return
+
+        if not self.output_dir:
+            # 默认输出到第一个文件所在目录
+            try:
+                self.output_dir = str(Path(webps[0]).resolve().parent)
+            except Exception:
+                self.output_dir = os.path.dirname(webps[0])
+            self.output_var.set(f"输出目录: {self.output_dir}")
+
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self._log_append(f"开始转换图片：WebP -> {fmt.upper()}，共 {len(webps)} 个文件\n")
+
+        ok = 0
+        fail = 0
+        out_files: list[str] = []
+
+        for src in webps:
+            try:
+                src_path = Path(src)
+                dst_path = Path(self.output_dir) / f"{src_path.stem}.{fmt}"
+
+                with Image.open(src_path) as im:
+                    if fmt == 'jpg':
+                        # jpg 不支持透明，转换为 RGB
+                        if im.mode in ('RGBA', 'LA'):
+                            bg = Image.new('RGB', im.size, (255, 255, 255))
+                            bg.paste(im, mask=im.split()[-1])
+                            im_out = bg
+                        else:
+                            im_out = im.convert('RGB')
+                        im_out.save(dst_path, 'JPEG', quality=95, optimize=True)
+                    else:
+                        im.save(dst_path, 'PNG', optimize=True)
+
+                ok += 1
+                out_files.append(str(dst_path))
+                self._log_append(f"成功：{src_path.name} -> {dst_path.name}\n")
+            except Exception as e:
+                fail += 1
+                self._log_append(f"失败：{os.path.basename(src)}，原因：{str(e)}\n")
+
+        self._log_append(f"图片转换完成：成功 {ok}，失败 {fail}\n")
+
+        # 转换完成后不弹出二次确认，避免打断用户操作。
+        # 如需生成视频，用户可直接点击“开始转换”（支持 webp 直接转 mp4）。
+        if ok > 0:
+            self._set_status(f"图片转换完成：成功 {ok}，失败 {fail}")
 
     def check_ffmpeg(self):
         try:
