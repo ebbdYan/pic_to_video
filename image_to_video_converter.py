@@ -54,13 +54,14 @@ class ImageToVideoConverter:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # Drag and drop area
-        self.drop_frame = ttk.LabelFrame(main_frame, text="拖放图片到这里", padding="20")
+        self.drop_frame = ttk.LabelFrame(main_frame, text="拖放图片或视频到这里", padding="20")
         self.drop_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         self.drop_label = ttk.Label(
             self.drop_frame,
-            text="点击或拖放图片文件到此处",
-            font=('Helvetica', 12)
+            text="点击或拖放图片/视频文件到此处\n(图片转视频，视频转图片)",
+            font=('Helvetica', 12),
+            justify=tk.CENTER
         )
         self.drop_label.pack(expand=True)
 
@@ -313,14 +314,24 @@ class ImageToVideoConverter:
             self._bind_hover_recursive(child)
 
     def is_supported_file(self, file_path: str) -> bool:
+        """当前支持的输入文件。
+
+        - 图片：用于“图片转视频”
+        - 视频：用于“从视频截取一张封面图”
+        """
         ext = os.path.splitext(file_path)[1].lower()
-        return ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+        return ext in [
+            '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp',
+            '.mp4', '.mov', '.mkv', '.avi', '.m4v', '.webm'
+        ]
 
     def browse_file(self, event=None):
         file_path = filedialog.askopenfilename(
-            title="选择图片文件",
+            title="选择图片/视频文件",
             filetypes=(
+                ("图片/视频", "*.jpg;*.jpeg;*.png;*.bmp;*.tiff;*.webp;*.mp4;*.mov;*.mkv;*.avi;*.m4v;*.webm"),
                 ("图片文件", "*.jpg;*.jpeg;*.png;*.bmp;*.tiff;*.webp"),
+                ("视频文件", "*.mp4;*.mov;*.mkv;*.avi;*.m4v;*.webm"),
                 ("所有文件", "*.*")
             )
         )
@@ -479,8 +490,110 @@ class ImageToVideoConverter:
             self.root.after(100, self.root.quit)
             return False
 
+    def _is_image_file(self, file_path: str) -> bool:
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+
+    def _is_video_file(self, file_path: str) -> bool:
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in ['.mp4', '.mov', '.mkv', '.avi', '.m4v', '.webm']
+
+    def _extract_frame(self, video_path: str, on_done=None):
+        """从视频中截取一张图片（第一帧附近），保存为“视频名.jpg”。on_done(success: bool)"""
+        if not video_path or not os.path.exists(video_path):
+            self._set_status("处理失败")
+            self._log_append(f"视频不存在：{video_path}\n")
+            if on_done:
+                on_done(False)
+            return
+
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir, exist_ok=True)
+
+        input_path = Path(video_path)
+        output_path = Path(self.output_dir) / f"{input_path.stem}.jpg"
+
+        # 取 0 秒处的帧（有些视频第 0 帧是黑屏，可按需改为 0.1）
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", "0",
+            "-i", str(input_path),
+            "-frames:v", "1",
+            "-q:v", "2",
+            str(output_path)
+        ]
+
+        ffmpeg_cmd_str = " ".join(cmd)
+        logger.info(f"Starting frame extraction. Input: {input_path}, Output: {output_path}")
+        logger.info("FFmpeg command: " + ffmpeg_cmd_str)
+        self._log_append("FFmpeg 指令:\n" + ffmpeg_cmd_str + "\n\n")
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0)
+            )
+
+            def worker_wait():
+                try:
+                    out, err = process.communicate()
+                    return_code = process.returncode
+
+                    file_ok = output_path.exists() and output_path.stat().st_size > 0
+                    logger.info(
+                        f"FFmpeg exited. return_code={return_code}, file_ok={file_ok}, output_exists={output_path.exists()}"
+                    )
+
+                    def update_ui():
+                        if return_code == 0 and file_ok:
+                            self._log_append(
+                                f"截帧成功！\n输出文件: {output_path}\n大小: {output_path.stat().st_size} bytes\n"
+                            )
+                            if on_done:
+                                on_done(True)
+                        else:
+                            debug = []
+                            debug.append("截帧失败（请查看下方日志/错误信息）\n")
+                            debug.append("FFmpeg 命令:\n" + ffmpeg_cmd_str)
+                            debug.append(f"返回码: {return_code}")
+                            if output_path.exists():
+                                debug.append(f"输出文件大小: {output_path.stat().st_size} bytes")
+                            else:
+                                debug.append("输出文件不存在")
+                            if err:
+                                debug.append("\nFFmpeg 错误输出(stderr):\n" + err)
+                            if out:
+                                debug.append("\nFFmpeg 标准输出(stdout):\n" + out)
+                            self._log_append("\n\n".join(debug) + "\n")
+                            if on_done:
+                                on_done(False)
+
+                    self.root.after(0, update_ui)
+
+                except Exception as e:
+                    logger.exception("worker_wait exception")
+
+                    def update_ui_error():
+                        self._log_append(f"等待 FFmpeg 结束时发生异常:\n{str(e)}\n")
+                        if on_done:
+                            on_done(False)
+
+                    self.root.after(0, update_ui_error)
+
+            threading.Thread(target=worker_wait, daemon=True).start()
+
+        except Exception as e:
+            self._log_append(f"执行 FFmpeg 时出错:\n{str(e)}\n")
+            logger.exception("Exception while running FFmpeg")
+            if on_done:
+                on_done(False)
+
     def _convert_one(self, file_path: str, on_done=None):
-        """转换单张图片。on_done(success: bool)"""
+        """转换单张图片为视频。on_done(success: bool)"""
         if not file_path or not os.path.exists(file_path):
             self._set_status("转换失败")
             self._log_append(f"图片不存在：{file_path}\n")
@@ -588,14 +701,14 @@ class ImageToVideoConverter:
 
     def convert(self):
         if self._is_converting:
-            self._log_append("正在转换中，请稍候...\n")
+            self._log_append("正在处理中，请稍候...\n")
             return
 
         queue = self.input_files if self.input_files else ([self.input_file] if self.input_file else [])
         queue = [q for q in queue if q and os.path.exists(q) and self.is_supported_file(q)]
 
         if not queue:
-            messagebox.showerror("错误", "请选择有效的图片文件")
+            messagebox.showerror("错误", "请选择有效的图片或视频文件")
             return
 
         self._is_converting = True
@@ -626,10 +739,14 @@ class ImageToVideoConverter:
             current = queue[self._batch_index]
             self._batch_index += 1
 
-            self._set_status(f"正在转换（{self._batch_index}/{self._batch_total}）：{os.path.basename(current)}")
-            self._convert_one(current, on_done=lambda ok: run_next(ok))
+            if self._is_video_file(current):
+                self._set_status(f"正在截帧（{self._batch_index}/{self._batch_total}）：{os.path.basename(current)}")
+                self._extract_frame(current, on_done=lambda ok: run_next(ok))
+            else:
+                self._set_status(f"正在转换（{self._batch_index}/{self._batch_total}）：{os.path.basename(current)}")
+                self._convert_one(current, on_done=lambda ok: run_next(ok))
 
-        # 启动第一张
+        # 启动第一个任务
         run_next(None)
 
 
